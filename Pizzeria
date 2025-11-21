@@ -1,0 +1,236 @@
+blueprint:
+  name: Pizzeria Delivery Tracker (Sabba & Betto Edition)
+  description: >
+    Sistema professionale per tracciare le consegne delle pizze.
+    Gestisce:
+    - Rilevamento automatico consegna (Stop > 1 min)
+    - Rilevamento rifornimento carburante
+    - Annuncio vocale (Alexa/TTS) con via di consegna
+    - Annuncio rientro in sede
+    - Gestione GPS Alta precisione (Android) in orario lavoro
+    
+    Richiede un Helper (Input Boolean) creato manualmente per la memoria.
+  domain: automation
+  input:
+    vehicle_tracker:
+      name: Veicolo (Tracker)
+      description: Il device_tracker del telefono nell'auto (es. device_tracker.panda).
+      selector:
+        entity:
+          domain: device_tracker
+    
+    battery_sensor:
+      name: Sensore Batteria
+      description: Sensore livello batteria del telefono.
+      selector:
+        entity:
+          domain: sensor
+          device_class: battery
+
+    geocoded_sensor:
+      name: Sensore Indirizzo (Geocoded)
+      description: Sensore che contiene l'indirizzo attuale (es. sensor.panda_geocoded_location).
+      selector:
+        entity:
+          domain: sensor
+
+    data_sensor:
+      name: Sensore Dati GB (Opzionale)
+      description: Sensore utilizzo dati mobili.
+      default: []
+      selector:
+        entity:
+          domain: sensor
+    
+    pizzeria_zone:
+      name: Zona Pizzeria
+      description: La zona della sede.
+      selector:
+        entity:
+          domain: zone
+
+    gas_station_zones:
+      name: Zone Distributori
+      description: Le zone dei benzinai da monitorare.
+      default: []
+      selector:
+        entity:
+          domain: zone
+          multiple: true
+
+    notify_device:
+      name: Dispositivo per Notifica Telegram
+      description: Il servizio di notifica (es. notify.telegram_sabba).
+      selector:
+        text:
+
+    alexa_media_players:
+      name: Dispositivi Alexa/TTS
+      description: Gli echo o media player dove fare gli annunci.
+      selector:
+        target:
+          entity:
+            domain: notify
+
+    helper_memory:
+      name: Helper Memoria
+      description: Seleziona l'input_boolean creato per la memoria (es. input_boolean.panda_in_consegna).
+      selector:
+        entity:
+          domain: input_boolean
+
+    notify_mobile_app:
+      name: Servizio Notifica Telefono (Android)
+      description: Servizio per attivare GPS Alta precisione (es. notify.mobile_app_panda).
+      selector:
+        text:
+
+    work_start_time:
+      name: Orario Inizio Turno
+      description: Ora in cui attivare il GPS Alta Precisione.
+      default: "18:00:00"
+      selector:
+        time:
+
+    work_end_time:
+      name: Orario Fine Turno
+      description: Ora in cui spegnere il GPS Alta Precisione.
+      default: "23:30:00"
+      selector:
+        time:
+
+mode: queued
+
+trigger:
+  # 1. STOP CONSEGNA
+  - platform: numeric_state
+    entity_id: !input vehicle_tracker
+    attribute: speed
+    below: 2.0
+    for: "00:01:00"
+    id: "stop_rilevato"
+
+  # 2. RIPARTENZA
+  - platform: numeric_state
+    entity_id: !input vehicle_tracker
+    attribute: speed
+    above: 5.0
+    id: "ripartenza_rilevata"
+
+  # 3. RIFORNIMENTO (Stop breve)
+  - platform: numeric_state
+    entity_id: !input vehicle_tracker
+    attribute: speed
+    below: 2.0
+    for: "00:00:20"
+    id: "stop_benzina"
+
+  # 4. RIENTRO SEDE
+  - platform: zone
+    entity_id: !input vehicle_tracker
+    zone: !input pizzeria_zone
+    event: enter
+    id: "rientro_sede"
+
+  # 5. GESTIONE GPS ORARIO
+  - platform: time
+    at: !input work_start_time
+    id: "inizio_turno"
+  - platform: time
+    at: !input work_end_time
+    id: "fine_turno"
+
+condition: []
+
+action:
+  - choose:
+      # --- CASO A: STOP CONSEGNA (Arma il sistema) ---
+      - conditions:
+          - condition: trigger
+            id: "stop_rilevato"
+          - condition: not
+            conditions:
+              - condition: state
+                entity_id: !input vehicle_tracker
+                state: !input pizzeria_zone
+              # Esclusione Benzinai (Loop sui benzinai selezionati)
+              - condition: template
+                value_template: >
+                  {{ state_attr(trigger.entity_id, 'friendly_name') not in area_name(trigger.entity_id) }} 
+                  {# Nota: La logica zone multiple in blueprint è complessa, qui semplifichiamo col template distanza #}
+          - condition: template
+            value_template: "{{ distance(states[trigger.entity_id].entity_id, states[inputs.pizzeria_zone].entity_id) > 0.1 }}"
+        sequence:
+          - service: input_boolean.turn_on
+            target:
+              entity_id: !input helper_memory
+
+      # --- CASO B: RIPARTENZA (Notifica Consegna) ---
+      - conditions:
+          - condition: trigger
+            id: "ripartenza_rilevata"
+          - condition: state
+            entity_id: !input helper_memory
+            state: "on"
+        sequence:
+          # Telegram
+          - service: !input notify_device
+            data:
+              message: >
+                ✅ Consegna effettuata!
+                📍 Posizione: {{ states(inputs.geocoded_sensor) }}
+                🔋 Batteria: {{ states(inputs.battery_sensor) }}%
+                {% if inputs.data_sensor %}📶 Dati: {{ states(inputs.data_sensor) }} GB{% endif %}
+          # Alexa
+          - service: notify.send_message
+            target: !input alexa_media_players
+            data:
+              message: "Consegna effettuata in {{ states(inputs.geocoded_sensor) }}."
+          # Reset
+          - service: input_boolean.turn_off
+            target:
+              entity_id: !input helper_memory
+
+      # --- CASO C: RIFORNIMENTO ---
+      - conditions:
+          - condition: trigger
+            id: "stop_benzina"
+          - condition: zone
+            entity_id: !input vehicle_tracker
+            zone: !input gas_station_zones
+        sequence:
+          - service: !input notify_device
+            data:
+              message: "⛽ Rifornimento in corso presso: {{ states(trigger.entity_id) }}"
+          - service: notify.send_message
+            target: !input alexa_media_players
+            data:
+              message: "Attenzione: Rifornimento in corso."
+
+      # --- CASO D: RIENTRO SEDE ---
+      - conditions:
+          - condition: trigger
+            id: "rientro_sede"
+        sequence:
+          - service: notify.send_message
+            target: !input alexa_media_players
+            data:
+              message: "Attenzione: Il veicolo è rientrato in pizzeria."
+
+      # --- CASO E: GESTIONE GPS ---
+      - conditions:
+          - condition: trigger
+            id: "inizio_turno"
+        sequence:
+          - service: !input notify_mobile_app
+            data:
+              message: "command_high_accuracy_mode"
+              title: "turn_on"
+      - conditions:
+          - condition: trigger
+            id: "fine_turno"
+        sequence:
+          - service: !input notify_mobile_app
+            data:
+              message: "command_high_accuracy_mode"
+              title: "turn_off"
